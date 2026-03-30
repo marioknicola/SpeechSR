@@ -1,4 +1,11 @@
 # SpeechSR
+This is a repository containing code and example images of work done to produce synthetically supervised deep-learning networks for super-resolution of real-time MRI of speech. The "Proposed" network (March 2026) architecture is shown below.
+
+![Proposed network architecture](<example images/Proposed network.png>)
+
+And the inference on a held-out subject's Synthetic LR data is shown below.
+
+![Proposed vs input and output](<example images/Proposed vs input and output.png>)
 
 ## Repository structure
 
@@ -126,7 +133,7 @@ python train.py \
   --epochs 200
 ```
 
-Ensure that a GPU runtime is enabled (top-left of the screen). The T4 is allowed for free.
+Ensure that a GPU runtime is enabled (top-left of the screen). The T4 is allowed for free (for a certain session length).
 
 ## Utilities
 
@@ -166,17 +173,20 @@ Supported models are:
 For model-specific command examples and checkpoint conventions, see:
 - `models/pretrained/README.md`
 
-## Inference result figures (add your own)
+## Inference result figures
+Static results on a held-out subject below:
+![Static results](<example images/Static results.png>)
 
-Paste your images below after pushing or locally previewing in Markdown:
+Dynamic results on a held-out subject below:
+![Dynamic results](<example images/Dynamic results.png>)
 
-```markdown
-## Sample Inference Results
+tCNR on three models below:
+![tCNR](<example images/tCNR example.png>)
 
-![U-Net qualitative result](path/to/unet_result.png)
-![Proposed qualitative result](path/to/proposed_result.png)
-![Comparison panel](path/to/comparison_panel.png)
-```
+
+## Synthetic Low-resolution vs High-resolution
+![HR vs Synth LR](<example images/HR vs Synth LR.png>)
+
 
 ## Notes
 
