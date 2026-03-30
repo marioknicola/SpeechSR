@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.env
+
+# Notebooks and IDE
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.github/copilot-instructions.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build and logs
+build/
+dist/
+runs/
+logs/
+outputs/
+
+# Model checkpoints and exports
+*.pt
+*.ckpt
+*.onnx
+
+# Data and private assets
+*.nii
+*.nii.gz
+*.mat
+*.h5
+*.hdf5
+
+# Keep dataset folder skeleton
+!data/**/.gitkeep
