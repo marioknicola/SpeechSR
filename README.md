@@ -177,12 +177,14 @@ For model-specific command examples and checkpoint conventions, see:
 Static results on a held-out subject below:
 ![Static results](<example images/Static results.png>)
 
-Dynamic results on a held-out subject below:
+Dynamic results on a held-out subject below (single-frame):
 ![Dynamic results](<example images/Dynamic results.png>)
 
 tCNR on three models below:
 ![tCNR](<example images/tCNR example.png>)
 
+Dynamic input vs proposed:
+<video controls src="example images/Input vs Proposed Dynamic.mov" title="Dynamic speech input (left) and proposed model's output (right)"></video>
 
 ## Synthetic Low-resolution vs High-resolution
 ![HR vs Synth LR](<example images/HR vs Synth LR.png>)
