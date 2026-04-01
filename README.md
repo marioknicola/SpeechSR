@@ -189,6 +189,9 @@ Dynamic input vs proposed:
 ## Synthetic Low-resolution vs High-resolution
 ![HR vs Synth LR](<example images/HR vs Synth LR.png>)
 
+## Zoomed input vs proposed vs HR
+![inference zoomed](<example images/inference zoomed.png>)
+
 
 ## Notes
 
