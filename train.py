@@ -16,7 +16,16 @@ from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 
-from models import CombinedL2SSIMLoss, ForegroundEdgeLoss, build_proposed, build_unet
+from models import (
+    CombinedL2SSIMLoss,
+    ForegroundEdgeLoss,
+    ForegroundEdgePerceptualLoss,
+    build_proposed1,
+    build_proposed2,
+    build_unet,
+)
+
+build_proposed = build_proposed2  # default
 
 
 def set_seed(seed: int) -> None:
@@ -76,11 +85,15 @@ class PairedMRIDataset(Dataset):
         model_name: str,
         subjects: list[str] | None = None,
         proposed_target_size: int = 1024,
+        patch_size: int | None = None,
+        augment: bool = False,
     ) -> None:
         self.input_dir = input_dir
         self.target_dir = target_dir
         self.model_name = model_name
         self.proposed_target_size = proposed_target_size
+        self.patch_size = patch_size        # LR patch size; HR patch = patch_size × scale
+        self.augment = augment              # random horizontal flip
         self.samples = self._build_samples(subjects)
         if not self.samples:
             raise ValueError("No paired samples were found. Check naming and input/target folders.")
@@ -130,17 +143,45 @@ class PairedMRIDataset(Dataset):
         lr = normalize01(lr_volume[:, :, sample.frame_idx])
         hr = normalize01(hr_volume[:, :, frame_idx])
 
-        if self.model_name == "proposed":
+        if self.model_name in ("proposed", "proposed2"):
             hr = kspace_zeropad(hr, target_size=self.proposed_target_size)
         else:
             if hr.shape != lr.shape:
                 hr_tensor = torch.from_numpy(hr).unsqueeze(0).unsqueeze(0)
                 hr = F.interpolate(hr_tensor, size=lr.shape, mode="bilinear", align_corners=False).squeeze().numpy()
 
-        return {
-            "input": torch.from_numpy(lr).unsqueeze(0),
-            "target": torch.from_numpy(hr).unsqueeze(0),
-        }
+        lr_t = torch.from_numpy(lr).unsqueeze(0)   # (1, H_lr, W_lr)
+        hr_t = torch.from_numpy(hr).unsqueeze(0)   # (1, H_hr, W_hr)
+
+        if self.patch_size is not None:
+            lr_t, hr_t = self._random_patch(lr_t, hr_t)
+
+        if self.augment and random.random() < 0.5:
+            lr_t = torch.flip(lr_t, dims=[2])
+            hr_t = torch.flip(hr_t, dims=[2])
+
+        return {"input": lr_t, "target": hr_t}
+
+    def _random_patch(self, lr: torch.Tensor, hr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Extract a random spatially-aligned patch from the LR/HR pair."""
+        _, lh, lw = lr.shape
+        _, hh, hw = hr.shape
+        scale = hh // lh  # e.g. 8 for proposed, 1 for unet
+
+        ps = self.patch_size
+        if lh < ps or lw < ps:
+            # Image smaller than requested patch — return the full image
+            return lr, hr
+
+        y0_lr = random.randint(0, lh - ps)
+        x0_lr = random.randint(0, lw - ps)
+        y0_hr, x0_hr = y0_lr * scale, x0_lr * scale
+        hr_ps = ps * scale
+
+        return (
+            lr[:, y0_lr:y0_lr + ps, x0_lr:x0_lr + ps],
+            hr[:, y0_hr:y0_hr + hr_ps, x0_hr:x0_hr + hr_ps],
+        )
 
 
 def split_subjects(all_subjects: list[str], val_subject: str, test_subject: str) -> tuple[list[str], list[str], list[str]]:
@@ -157,8 +198,16 @@ def build_model(model_name: str, hyperparams: dict[str, Any]) -> nn.Module:
             bilinear=bool(hyperparams.get("bilinear", True)),
         )
 
-    if model_name == "proposed":
-        return build_proposed(
+    if model_name == "proposed1":
+        return build_proposed1(
+            n_res_blocks=int(hyperparams.get("n_res_blocks", 16)),
+            n_feats=int(hyperparams.get("n_feats", 64)),
+            reduction=int(hyperparams.get("reduction", 16)),
+            res_scale=float(hyperparams.get("res_scale", 0.1)),
+        )
+
+    if model_name in ("proposed", "proposed2"):
+        return build_proposed2(
             n_res_blocks=int(hyperparams.get("n_res_blocks", 16)),
             n_feats=int(hyperparams.get("n_feats", 64)),
             reduction=int(hyperparams.get("reduction", 16)),
@@ -168,9 +217,17 @@ def build_model(model_name: str, hyperparams: dict[str, Any]) -> nn.Module:
     raise ValueError(f"Unsupported model name: {model_name}")
 
 
-def build_loss(model_name: str, hyperparams: dict[str, Any]) -> nn.Module:
+def build_loss(model_name: str, hyperparams: dict[str, Any], perceptual: bool = False) -> nn.Module:
     if model_name == "unet":
         return CombinedL2SSIMLoss(alpha_l2=float(hyperparams.get("alpha_l2", 0.7)))
+    if perceptual:
+        return ForegroundEdgePerceptualLoss(
+            alpha_l1=float(hyperparams.get("alpha_l1", 0.25)),
+            alpha_sobel=float(hyperparams.get("alpha_sobel", 0.35)),
+            alpha_laplacian=float(hyperparams.get("alpha_laplacian", 0.25)),
+            alpha_ssim=float(hyperparams.get("alpha_ssim", 0.15)),
+            alpha_percep=float(hyperparams.get("alpha_percep", 0.1)),
+        )
     return ForegroundEdgeLoss(
         alpha_l1=float(hyperparams.get("alpha_l1", 0.25)),
         alpha_sobel=float(hyperparams.get("alpha_sobel", 0.35)),
@@ -218,12 +275,17 @@ def train_once(args: argparse.Namespace, hyperparams: dict[str, Any], run_name: 
 
     train_subjects, val_subjects, test_subjects = split_subjects(args.subjects, args.val_subject, args.test_subject)
 
+    patch_size = args.patch_size if hasattr(args, "patch_size") else None
+    augment = args.augment if hasattr(args, "augment") else False
+
     train_dataset = PairedMRIDataset(
         input_dir=Path(args.input_dir),
         target_dir=Path(args.target_dir),
         model_name=args.model,
         subjects=train_subjects,
         proposed_target_size=args.proposed_target_size,
+        patch_size=patch_size,
+        augment=augment,
     )
     val_dataset = PairedMRIDataset(
         input_dir=Path(args.input_dir),
@@ -231,6 +293,7 @@ def train_once(args: argparse.Namespace, hyperparams: dict[str, Any], run_name: 
         model_name=args.model,
         subjects=val_subjects,
         proposed_target_size=args.proposed_target_size,
+        # No patching or augmentation for val/test — evaluate on full images
     )
     test_dataset = PairedMRIDataset(
         input_dir=Path(args.input_dir),
@@ -246,7 +309,8 @@ def train_once(args: argparse.Namespace, hyperparams: dict[str, Any], run_name: 
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers)
 
     model = build_model(args.model, hyperparams).to(device)
-    criterion = build_loss(args.model, hyperparams)
+    perceptual = getattr(args, "perceptual_loss", False)
+    criterion = build_loss(args.model, hyperparams, perceptual=perceptual).to(device)
     optimizer = Adam(model.parameters(), lr=float(hyperparams.get("lr", args.lr)), weight_decay=float(hyperparams.get("weight_decay", args.weight_decay)))
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=float(hyperparams.get("eta_min", 1e-6)))
 
@@ -322,6 +386,8 @@ def run_optuna(args: argparse.Namespace) -> dict[str, Any]:
                     "alpha_ssim": trial.suggest_float("alpha_ssim", 0.1, 0.25),
                 }
             )
+            if getattr(args, "perceptual_loss", False):
+                params["alpha_percep"] = trial.suggest_float("alpha_percep", 0.05, 0.2)
         return params
 
     def objective(trial: "optuna.Trial") -> float:
@@ -363,7 +429,8 @@ def pick_device(device_arg: str) -> torch.device:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train U-Net or Proposed model with optional Optuna HPO")
-    parser.add_argument("--model", choices=["unet", "proposed"], required=True)
+    parser.add_argument("--model", choices=["unet", "proposed1", "proposed2", "proposed"], required=True,
+                        help="proposed/proposed2 = V2 (default, recommended). proposed1 = archived V1.")
     parser.add_argument("--input-dir", type=str, default="data/images/Synth_LR")
     parser.add_argument("--target-dir", type=str, default="data/images/HR")
     parser.add_argument("--output-dir", type=str, default="outputs")
@@ -382,6 +449,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto", help="auto, cpu, cuda, mps")
 
     parser.add_argument("--proposed-target-size", type=int, default=1024)
+
+    parser.add_argument(
+        "--patch-size",
+        type=int,
+        default=None,
+        metavar="N",
+        help="LR patch size for patch-based training (e.g. 64). HR patch is N×scale. "
+             "Recommended with small datasets: multiplies effective samples per epoch by ~50-100×.",
+    )
+    parser.add_argument(
+        "--augment",
+        action="store_true",
+        help="Random horizontal flip augmentation. Recommended when --patch-size is set.",
+    )
+    parser.add_argument(
+        "--perceptual-loss",
+        action="store_true",
+        help="Add VGG19 perceptual term to the proposed model loss (ForegroundEdgePerceptualLoss). "
+             "Reduces over-smoothing by matching feature-space texture. Requires torchvision.",
+    )
 
     parser.add_argument("--use-optuna", action="store_true")
     parser.add_argument("--n-trials", type=int, default=20)
