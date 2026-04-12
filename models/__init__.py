@@ -8,6 +8,7 @@ from .losses import (
     ForegroundEdgePerceptualLoss,
     KSpaceConsistencyLoss,
     PerceptualLoss,
+    TemporalConsistencyLoss,
 )
 
 # 'proposed' always refers to the current default (V2)
@@ -31,4 +32,5 @@ __all__ = [
     "ForegroundEdgePerceptualLoss",
     "KSpaceConsistencyLoss",
     "PerceptualLoss",
+    "TemporalConsistencyLoss",
 ]

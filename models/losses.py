@@ -73,8 +73,8 @@ class ForegroundEdgeLoss(nn.Module):
         alpha_sobel: float = 0.35,
         alpha_laplacian: float = 0.25,
         alpha_ssim: float = 0.15,
-        fg_threshold: float = 0.05,
-        fg_steepness: float = 5.0,
+        fg_threshold: float = 0.01,
+        fg_steepness: float = 1.5,
     ) -> None:
         super().__init__()
         total = alpha_l1 + alpha_sobel + alpha_laplacian + alpha_ssim
@@ -88,6 +88,9 @@ class ForegroundEdgeLoss(nn.Module):
         self.laplacian = LaplacianLoss()
 
     def _mask(self, target: torch.Tensor) -> torch.Tensor:
+        # Softer mask: threshold=0.01, steepness=1.5 → only pitch-black pixels
+        # lose weight. Dim anatomy (tongue tip, arytenoids) at 0.05–0.15 now
+        # receives ~90% weight instead of being nearly zeroed out.
         return torch.sigmoid(self.fg_steepness * (target - self.fg_threshold))
 
     def _ssim_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -106,11 +109,15 @@ class ForegroundEdgeLoss(nn.Module):
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         mask = self._mask(target)
         l1_masked = (torch.abs(pred - target) * mask).sum() / (mask.sum() + 1e-8)
+        # Unmasked safety-net: guarantees a gradient for every pixel regardless
+        # of the mask value, preventing dim-feature erasure.
+        l1_full = F.l1_loss(pred, target)
         sobel_loss = self.sobel(pred, target)
         laplacian_loss = self.laplacian(pred, target)
         ssim_loss = self._ssim_loss(pred, target)
         return (
             self.alpha_l1 * l1_masked
+            + 0.05 * l1_full
             + self.alpha_sobel * sobel_loss
             + self.alpha_laplacian * laplacian_loss
             + self.alpha_ssim * ssim_loss
@@ -244,3 +251,40 @@ class ForegroundEdgePerceptualLoss(nn.Module):
             p = F.interpolate(p, size=self.max_percep_size, mode="bilinear", align_corners=False)
             t = F.interpolate(t, size=self.max_percep_size, mode="bilinear", align_corners=False)
         return self.pixel_loss(pred, target) + self.alpha_percep * self.perceptual(p, t)
+
+
+class TemporalConsistencyLoss(nn.Module):
+    """
+    Motion-weighted L1 loss between SR outputs of two adjacent temporal windows.
+
+    Sustained-phoneme data provides a strong self-supervised signal: consecutive
+    frames should be nearly identical in tissue regions that are not moving.
+    The motion weight exp(-steepness * |LR_t+1 - LR_t|) relaxes the penalty
+    in genuinely moving regions (tongue tip, velum) while enforcing consistency
+    everywhere else.
+
+    Arguments:
+        motion_steepness: controls how quickly the weight decays with motion.
+            Higher → only very static regions penalised. Lower → broader penalty.
+        upsample_mode: how to resize the LR motion map to SR resolution.
+    """
+
+    def __init__(self, motion_steepness: float = 10.0, upsample_mode: str = "bilinear") -> None:
+        super().__init__()
+        self.motion_steepness = motion_steepness
+        self.upsample_mode = upsample_mode
+
+    def forward(
+        self,
+        sr_t: torch.Tensor,   # (B, 1, H_sr, W_sr) — SR of window centred on frame t
+        sr_t1: torch.Tensor,  # (B, 1, H_sr, W_sr) — SR of window centred on frame t+1
+        lr_window_t: torch.Tensor,  # (B, 3, H_lr, W_lr) — LR input for sr_t (t-1, t, t+1)
+    ) -> torch.Tensor:
+        # Motion proxy: |LR(t+1) - LR(t)| — centre frames of adjacent windows
+        motion = (lr_window_t[:, 2:3] - lr_window_t[:, 1:2]).abs()   # (B, 1, H_lr, W_lr)
+        motion_up = F.interpolate(
+            motion, size=sr_t.shape[-2:],
+            mode=self.upsample_mode, align_corners=False,
+        )
+        weight = torch.exp(-self.motion_steepness * motion_up)  # ~1 on static, ~0 on fast-moving
+        return ((sr_t - sr_t1).abs() * weight).mean()

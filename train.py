@@ -1,4 +1,5 @@
 import argparse
+import itertools
 import json
 import random
 import re
@@ -20,12 +21,17 @@ from models import (
     CombinedL2SSIMLoss,
     ForegroundEdgeLoss,
     ForegroundEdgePerceptualLoss,
+    KSpaceConsistencyLoss,
+    TemporalConsistencyLoss,
     build_proposed1,
     build_proposed2,
     build_unet,
 )
 
 build_proposed = build_proposed2  # default
+
+# Files excluded from dynamic training by default.
+_DEFAULT_DYNAMIC_EXCLUDE = {"Subject0021_speech_128x128x200.nii"}
 
 
 def set_seed(seed: int) -> None:
@@ -69,6 +75,10 @@ def kspace_zeropad(image: np.ndarray, target_size: int) -> np.ndarray:
     return normalize01(output)
 
 
+# ---------------------------------------------------------------------------
+# Paired static dataset (supervised anchor)
+# ---------------------------------------------------------------------------
+
 @dataclass
 class Sample:
     input_path: Path
@@ -84,16 +94,18 @@ class PairedMRIDataset(Dataset):
         target_dir: Path,
         model_name: str,
         subjects: list[str] | None = None,
-        proposed_target_size: int = 1024,
+        proposed_target_size: int = 512,
         patch_size: int | None = None,
         augment: bool = False,
+        temporal: bool = False,
     ) -> None:
         self.input_dir = input_dir
         self.target_dir = target_dir
         self.model_name = model_name
         self.proposed_target_size = proposed_target_size
-        self.patch_size = patch_size        # LR patch size; HR patch = patch_size × scale
-        self.augment = augment              # random horizontal flip
+        self.patch_size = patch_size
+        self.augment = augment
+        self.temporal = temporal   # if True, return 3-channel LR (t-1, t, t+1)
         self.samples = self._build_samples(subjects)
         if not self.samples:
             raise ValueError("No paired samples were found. Check naming and input/target folders.")
@@ -140,18 +152,26 @@ class PairedMRIDataset(Dataset):
         hr_volume = load_nifti_frames(sample.target_path)
 
         frame_idx = min(sample.frame_idx, hr_volume.shape[2] - 1)
-        lr = normalize01(lr_volume[:, :, sample.frame_idx])
         hr = normalize01(hr_volume[:, :, frame_idx])
 
         if self.model_name in ("proposed", "proposed2"):
             hr = kspace_zeropad(hr, target_size=self.proposed_target_size)
         else:
-            if hr.shape != lr.shape:
+            if hr.shape != lr_volume[:, :, 0].shape:
                 hr_tensor = torch.from_numpy(hr).unsqueeze(0).unsqueeze(0)
-                hr = F.interpolate(hr_tensor, size=lr.shape, mode="bilinear", align_corners=False).squeeze().numpy()
+                hr = F.interpolate(hr_tensor, size=lr_volume.shape[:2], mode="bilinear", align_corners=False).squeeze().numpy()
 
-        lr_t = torch.from_numpy(lr).unsqueeze(0)   # (1, H_lr, W_lr)
-        hr_t = torch.from_numpy(hr).unsqueeze(0)   # (1, H_hr, W_hr)
+        if self.temporal:
+            n_frames = lr_volume.shape[2]
+            i = sample.frame_idx
+            prev_frame = normalize01(lr_volume[:, :, max(i - 1, 0)])
+            curr_frame = normalize01(lr_volume[:, :, i])
+            next_frame = normalize01(lr_volume[:, :, min(i + 1, n_frames - 1)])
+            lr_t = torch.from_numpy(np.stack([prev_frame, curr_frame, next_frame], axis=0))  # (3, H, W)
+        else:
+            lr_t = torch.from_numpy(normalize01(lr_volume[:, :, sample.frame_idx])).unsqueeze(0)  # (1, H, W)
+
+        hr_t = torch.from_numpy(hr).unsqueeze(0)  # (1, H, W)
 
         if self.patch_size is not None:
             lr_t, hr_t = self._random_patch(lr_t, hr_t)
@@ -163,14 +183,12 @@ class PairedMRIDataset(Dataset):
         return {"input": lr_t, "target": hr_t}
 
     def _random_patch(self, lr: torch.Tensor, hr: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Extract a random spatially-aligned patch from the LR/HR pair."""
         _, lh, lw = lr.shape
         _, hh, hw = hr.shape
-        scale = hh // lh  # e.g. 8 for proposed, 1 for unet
+        scale = hh // lh
 
         ps = self.patch_size
         if lh < ps or lw < ps:
-            # Image smaller than requested patch — return the full image
             return lr, hr
 
         y0_lr = random.randint(0, lh - ps)
@@ -184,6 +202,76 @@ class PairedMRIDataset(Dataset):
         )
 
 
+# ---------------------------------------------------------------------------
+# Unpaired real dynamic dataset (self-supervised temporal stream)
+# ---------------------------------------------------------------------------
+
+class DynamicMRIDataset(Dataset):
+    """
+    Unpaired dynamic MRI dataset for self-supervised temporal training.
+
+    Each sample returns two adjacent temporal windows from the same volume:
+        window_t  = frames (i-1, i,   i+1) as a 3-channel tensor
+        window_t1 = frames (i,   i+1, i+2) as a 3-channel tensor
+
+    The overlap (frames t and t+1 appear in both windows) lets the model be
+    penalised for inconsistent SR outputs on the shared content.
+
+    Files in the exclude set are skipped (default: the mixed-phoneme speech volume
+    which is reserved for held-out qualitative evaluation).
+    """
+
+    def __init__(
+        self,
+        dynamic_dir: Path,
+        exclude_files: set[str] | None = None,
+        augment: bool = False,
+    ) -> None:
+        self.augment = augment
+        exclude = exclude_files if exclude_files is not None else _DEFAULT_DYNAMIC_EXCLUDE
+
+        nii_files = sorted(dynamic_dir.glob("*.nii")) + sorted(dynamic_dir.glob("*.nii.gz"))
+        nii_files = [f for f in nii_files if f.name not in exclude]
+        if not nii_files:
+            raise ValueError(f"No dynamic NIfTI files found in {dynamic_dir} (after exclusions).")
+
+        # (file, start_frame_i) where window_t uses [i-1, i, i+1] and
+        # window_t1 uses [i, i+1, i+2] — so i must be in [1, n_frames-3].
+        self.samples: list[tuple[Path, int]] = []
+        for f in nii_files:
+            n = load_nifti_frames(f).shape[2]
+            for i in range(1, n - 2):
+                self.samples.append((f, i))
+
+        if not self.samples:
+            raise ValueError("No valid dynamic samples found (all volumes have < 4 frames?).")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        path, i = self.samples[idx]
+        vol = load_nifti_frames(path)
+
+        def _frame(fi: int) -> np.ndarray:
+            return normalize01(vol[:, :, fi])
+
+        # window_t: (i-1, i, i+1)
+        w_t = torch.from_numpy(np.stack([_frame(i - 1), _frame(i), _frame(i + 1)], axis=0))
+        # window_t1: (i, i+1, i+2)
+        w_t1 = torch.from_numpy(np.stack([_frame(i), _frame(i + 1), _frame(i + 2)], axis=0))
+
+        if self.augment and random.random() < 0.5:
+            w_t = torch.flip(w_t, dims=[2])
+            w_t1 = torch.flip(w_t1, dims=[2])
+
+        return {"window_t": w_t, "window_t1": w_t1}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def split_subjects(all_subjects: list[str], val_subject: str, test_subject: str) -> tuple[list[str], list[str], list[str]]:
     train_subjects = [subj for subj in all_subjects if subj not in {val_subject, test_subject}]
     if not train_subjects:
@@ -191,7 +279,9 @@ def split_subjects(all_subjects: list[str], val_subject: str, test_subject: str)
     return train_subjects, [val_subject], [test_subject]
 
 
-def build_model(model_name: str, hyperparams: dict[str, Any]) -> nn.Module:
+def build_model(model_name: str, hyperparams: dict[str, Any], temporal: bool = False) -> nn.Module:
+    in_channels = 3 if temporal else 1
+
     if model_name == "unet":
         return build_unet(
             base_filters=int(hyperparams.get("base_filters", 32)),
@@ -212,6 +302,7 @@ def build_model(model_name: str, hyperparams: dict[str, Any]) -> nn.Module:
             n_feats=int(hyperparams.get("n_feats", 64)),
             reduction=int(hyperparams.get("reduction", 16)),
             res_scale=float(hyperparams.get("res_scale", 0.1)),
+            in_channels=in_channels,
         )
 
     raise ValueError(f"Unsupported model name: {model_name}")
@@ -236,6 +327,20 @@ def build_loss(model_name: str, hyperparams: dict[str, Any], perceptual: bool = 
     )
 
 
+def pick_device(device_arg: str) -> torch.device:
+    if device_arg == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    return torch.device(device_arg)
+
+
+# ---------------------------------------------------------------------------
+# Training epochs
+# ---------------------------------------------------------------------------
+
 def run_epoch(
     model: nn.Module,
     dataloader: DataLoader,
@@ -244,6 +349,7 @@ def run_epoch(
     device: torch.device,
     max_grad_norm: float,
 ) -> float:
+    """Supervised-only epoch (used for val/test)."""
     is_train = optimizer is not None
     model.train(is_train)
     running_loss = 0.0
@@ -268,10 +374,87 @@ def run_epoch(
     return running_loss / max(1, len(dataloader))
 
 
+def run_joint_train_epoch(
+    model: nn.Module,
+    paired_loader: DataLoader,
+    dynamic_loader: DataLoader | None,
+    criterion: nn.Module,
+    temporal_criterion: TemporalConsistencyLoss,
+    kspace_criterion: KSpaceConsistencyLoss,
+    optimizer: Adam,
+    device: torch.device,
+    max_grad_norm: float,
+    lambda_temporal: float,
+    lambda_kspace_dyn: float,
+) -> dict[str, float]:
+    """
+    Joint supervised + self-supervised training epoch.
+
+    For each paired (LR, HR) batch, we also draw a dynamic batch
+    (window_t, window_t1) and add temporal consistency + k-space
+    consistency terms. When dynamic_loader is None, this degrades to
+    a standard supervised epoch.
+    """
+    model.train()
+    totals: dict[str, float] = {"sup": 0.0, "temporal": 0.0, "kspace_dyn": 0.0, "total": 0.0}
+
+    dyn_iter = itertools.cycle(dynamic_loader) if dynamic_loader is not None else None
+
+    for batch in paired_loader:
+        inputs = batch["input"].to(device)
+        targets = batch["target"].to(device)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        # Supervised loss (paired static)
+        sr = model(inputs)
+        loss_sup = criterion(sr, targets)
+
+        loss_total = loss_sup
+        loss_temporal = torch.zeros(1, device=device)
+        loss_kspace_dyn = torch.zeros(1, device=device)
+
+        # Auxiliary dynamic stream
+        if dyn_iter is not None:
+            dyn_batch = next(dyn_iter)
+            wt = dyn_batch["window_t"].to(device)    # (B, 3, H, W)
+            wt1 = dyn_batch["window_t1"].to(device)  # (B, 3, H, W)
+
+            sr_t = model(wt)
+            sr_t1 = model(wt1)
+
+            loss_temporal = temporal_criterion(sr_t, sr_t1, wt)
+            # K-space consistency: SR vs centre frame of the LR window
+            loss_kspace_dyn = kspace_criterion(sr_t, wt[:, 1:2])
+
+            loss_total = loss_sup + lambda_temporal * loss_temporal + lambda_kspace_dyn * loss_kspace_dyn
+
+        loss_total.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        optimizer.step()
+
+        totals["sup"] += float(loss_sup.item())
+        totals["temporal"] += float(loss_temporal.item())
+        totals["kspace_dyn"] += float(loss_kspace_dyn.item())
+        totals["total"] += float(loss_total.item())
+
+    n = max(1, len(paired_loader))
+    return {k: v / n for k, v in totals.items()}
+
+
+# ---------------------------------------------------------------------------
+# Full training run
+# ---------------------------------------------------------------------------
+
 def train_once(args: argparse.Namespace, hyperparams: dict[str, Any], run_name: str) -> float:
     output_dir = Path(args.output_dir) / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
     device = pick_device(args.device)
+
+    temporal = getattr(args, "temporal", False)
+    use_dynamic = getattr(args, "dynamic_dir", None) and not getattr(args, "no_dynamic", False)
+    lambda_temporal = float(getattr(args, "lambda_temporal", 0.10))
+    lambda_kspace_dyn = float(getattr(args, "lambda_kspace_dyn", 0.05))
 
     train_subjects, val_subjects, test_subjects = split_subjects(args.subjects, args.val_subject, args.test_subject)
 
@@ -286,6 +469,7 @@ def train_once(args: argparse.Namespace, hyperparams: dict[str, Any], run_name: 
         proposed_target_size=args.proposed_target_size,
         patch_size=patch_size,
         augment=augment,
+        temporal=temporal,
     )
     val_dataset = PairedMRIDataset(
         input_dir=Path(args.input_dir),
@@ -293,7 +477,7 @@ def train_once(args: argparse.Namespace, hyperparams: dict[str, Any], run_name: 
         model_name=args.model,
         subjects=val_subjects,
         proposed_target_size=args.proposed_target_size,
-        # No patching or augmentation for val/test — evaluate on full images
+        temporal=temporal,
     )
     test_dataset = PairedMRIDataset(
         input_dir=Path(args.input_dir),
@@ -301,6 +485,7 @@ def train_once(args: argparse.Namespace, hyperparams: dict[str, Any], run_name: 
         model_name=args.model,
         subjects=test_subjects,
         proposed_target_size=args.proposed_target_size,
+        temporal=temporal,
     )
 
     batch_size = int(hyperparams.get("batch_size", args.batch_size))
@@ -308,10 +493,28 @@ def train_once(args: argparse.Namespace, hyperparams: dict[str, Any], run_name: 
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=args.num_workers)
 
-    model = build_model(args.model, hyperparams).to(device)
+    dynamic_loader = None
+    if use_dynamic:
+        exclude = set(getattr(args, "exclude_files", [])) | _DEFAULT_DYNAMIC_EXCLUDE
+        dyn_dataset = DynamicMRIDataset(
+            dynamic_dir=Path(args.dynamic_dir),
+            exclude_files=exclude,
+            augment=augment,
+        )
+        dynamic_loader = DataLoader(dyn_dataset, batch_size=batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True)
+        print(f"Dynamic stream: {len(dyn_dataset)} samples from {args.dynamic_dir}", flush=True)
+
+    model = build_model(args.model, hyperparams, temporal=temporal).to(device)
     perceptual = getattr(args, "perceptual_loss", False)
     criterion = build_loss(args.model, hyperparams, perceptual=perceptual).to(device)
-    optimizer = Adam(model.parameters(), lr=float(hyperparams.get("lr", args.lr)), weight_decay=float(hyperparams.get("weight_decay", args.weight_decay)))
+    temporal_criterion = TemporalConsistencyLoss().to(device)
+    kspace_criterion = KSpaceConsistencyLoss(region_size=32)
+
+    optimizer = Adam(
+        model.parameters(),
+        lr=float(hyperparams.get("lr", args.lr)),
+        weight_decay=float(hyperparams.get("weight_decay", args.weight_decay)),
+    )
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=float(hyperparams.get("eta_min", 1e-6)))
 
     best_val_loss = float("inf")
@@ -320,14 +523,29 @@ def train_once(args: argparse.Namespace, hyperparams: dict[str, Any], run_name: 
     history: list[dict[str, float]] = []
     for epoch in range(1, args.epochs + 1):
         start = time.time()
-        train_loss = run_epoch(model, train_loader, criterion, optimizer, device, max_grad_norm=float(hyperparams.get("max_grad_norm", args.max_grad_norm)))
+        train_metrics = run_joint_train_epoch(
+            model, train_loader, dynamic_loader, criterion,
+            temporal_criterion, kspace_criterion,
+            optimizer, device,
+            max_grad_norm=float(hyperparams.get("max_grad_norm", args.max_grad_norm)),
+            lambda_temporal=lambda_temporal,
+            lambda_kspace_dyn=lambda_kspace_dyn,
+        )
         val_loss = run_epoch(model, val_loader, criterion, optimizer=None, device=device, max_grad_norm=0.0)
         scheduler.step()
 
         elapsed = time.time() - start
-        print(f"Epoch {epoch:03d}/{args.epochs} | train={train_loss:.6f} | val={val_loss:.6f} | lr={scheduler.get_last_lr()[0]:.2e} | {elapsed:.1f}s")
+        dyn_str = (f" t={train_metrics['temporal']:.4f} ks={train_metrics['kspace_dyn']:.4f}"
+                   if use_dynamic else "")
+        print(
+            f"Epoch {epoch:03d}/{args.epochs} | "
+            f"train={train_metrics['total']:.6f}{dyn_str} | "
+            f"val={val_loss:.6f} | "
+            f"lr={scheduler.get_last_lr()[0]:.2e} | {elapsed:.1f}s",
+            flush=True,
+        )
 
-        history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
+        history.append({"epoch": epoch, "train_loss": train_metrics["total"], "val_loss": val_loss, **train_metrics})
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save({"model_state_dict": model.state_dict(), "hyperparams": hyperparams}, best_path)
@@ -367,25 +585,18 @@ def run_optuna(args: argparse.Namespace) -> dict[str, Any]:
             "max_grad_norm": trial.suggest_categorical("max_grad_norm", [0.5, 1.0, 2.0]),
         }
         if args.model == "unet":
-            params.update(
-                {
-                    "base_filters": trial.suggest_categorical("base_filters", [16, 32, 64]),
-                    "alpha_l2": trial.suggest_float("alpha_l2", 0.5, 0.9),
-                }
-            )
+            params.update({"base_filters": trial.suggest_categorical("base_filters", [16, 32, 64]), "alpha_l2": trial.suggest_float("alpha_l2", 0.5, 0.9)})
         else:
-            params.update(
-                {
-                    "n_res_blocks": trial.suggest_categorical("n_res_blocks", [8, 12, 16]),
-                    "n_feats": trial.suggest_categorical("n_feats", [32, 48, 64]),
-                    "reduction": trial.suggest_categorical("reduction", [8, 16]),
-                    "res_scale": trial.suggest_categorical("res_scale", [0.05, 0.1, 0.2]),
-                    "alpha_l1": trial.suggest_float("alpha_l1", 0.2, 0.4),
-                    "alpha_sobel": trial.suggest_float("alpha_sobel", 0.2, 0.45),
-                    "alpha_laplacian": trial.suggest_float("alpha_laplacian", 0.1, 0.35),
-                    "alpha_ssim": trial.suggest_float("alpha_ssim", 0.1, 0.25),
-                }
-            )
+            params.update({
+                "n_res_blocks": trial.suggest_categorical("n_res_blocks", [8, 12, 16]),
+                "n_feats": trial.suggest_categorical("n_feats", [32, 48, 64]),
+                "reduction": trial.suggest_categorical("reduction", [8, 16]),
+                "res_scale": trial.suggest_categorical("res_scale", [0.05, 0.1, 0.2]),
+                "alpha_l1": trial.suggest_float("alpha_l1", 0.2, 0.4),
+                "alpha_sobel": trial.suggest_float("alpha_sobel", 0.2, 0.45),
+                "alpha_laplacian": trial.suggest_float("alpha_laplacian", 0.1, 0.35),
+                "alpha_ssim": trial.suggest_float("alpha_ssim", 0.1, 0.25),
+            })
             if getattr(args, "perceptual_loss", False):
                 params["alpha_percep"] = trial.suggest_float("alpha_percep", 0.05, 0.2)
         return params
@@ -417,20 +628,9 @@ def run_optuna(args: argparse.Namespace) -> dict[str, Any]:
     return best
 
 
-def pick_device(device_arg: str) -> torch.device:
-    if device_arg == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-    return torch.device(device_arg)
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train U-Net or Proposed model with optional Optuna HPO")
-    parser.add_argument("--model", choices=["unet", "proposed1", "proposed2", "proposed"], required=True,
-                        help="proposed/proposed2 = V2 (default, recommended). proposed1 = archived V1.")
+    parser = argparse.ArgumentParser(description="Train SpeechSR with optional dynamic auxiliary stream")
+    parser.add_argument("--model", choices=["unet", "proposed1", "proposed2", "proposed"], required=True)
     parser.add_argument("--input-dir", type=str, default="data/images/Synth_LR")
     parser.add_argument("--target-dir", type=str, default="data/images/HR")
     parser.add_argument("--output-dir", type=str, default="outputs")
@@ -446,30 +646,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default="auto", help="auto, cpu, cuda, mps")
+    parser.add_argument("--device", type=str, default="auto")
 
-    parser.add_argument("--proposed-target-size", type=int, default=1024)
+    parser.add_argument("--proposed-target-size", type=int, default=512,
+                        help="HR output size in pixels (default 512 = 4× from 128 LR).")
 
-    parser.add_argument(
-        "--patch-size",
-        type=int,
-        default=None,
-        metavar="N",
-        help="LR patch size for patch-based training (e.g. 64). HR patch is N×scale. "
-             "Recommended with small datasets: multiplies effective samples per epoch by ~50-100×.",
-    )
-    parser.add_argument(
-        "--augment",
-        action="store_true",
-        help="Random horizontal flip augmentation. Recommended when --patch-size is set.",
-    )
-    parser.add_argument(
-        "--perceptual-loss",
-        action="store_true",
-        help="Add VGG19 perceptual term to the proposed model loss (ForegroundEdgePerceptualLoss). "
-             "Reduces over-smoothing by matching feature-space texture. Requires torchvision.",
-    )
+    parser.add_argument("--patch-size", type=int, default=None, metavar="N")
+    parser.add_argument("--augment", action="store_true")
+    parser.add_argument("--perceptual-loss", action="store_true")
 
+    # Temporal mode
+    parser.add_argument("--temporal", action="store_true",
+                        help="Stack (t-1, t, t+1) as 3-channel input (required for dynamic SR).")
+
+    # Dynamic auxiliary stream
+    parser.add_argument("--dynamic-dir", type=str, default=None,
+                        help="Path to Dynamic_128/ directory of real unpaired dynamic NIfTI files.")
+    parser.add_argument("--lambda-temporal", type=float, default=0.10,
+                        help="Weight of motion-weighted temporal consistency loss on dynamic stream.")
+    parser.add_argument("--lambda-kspace-dyn", type=float, default=0.05,
+                        help="Weight of k-space data consistency loss on dynamic stream.")
+    parser.add_argument("--exclude-files", nargs="*", default=[],
+                        help="Additional dynamic filenames to exclude from training.")
+    parser.add_argument("--no-dynamic", action="store_true",
+                        help="Disable dynamic stream even if --dynamic-dir is set (ablation).")
+
+    # Optuna
     parser.add_argument("--use-optuna", action="store_true")
     parser.add_argument("--n-trials", type=int, default=20)
     parser.add_argument("--hpo-epochs", type=int, default=20)

@@ -2,42 +2,38 @@
 Two-stage GAN training for SpeechSR.
 
 Stage 1 — generator pretraining:
-    Trains the generator with ForegroundEdgePerceptualLoss only. This gives
-    the generator a strong starting point so the discriminator does not win
-    immediately in Stage 2. Skip this stage (--pretrain-epochs 0) if you
-    already have a good generator checkpoint from train.py.
+    Trains the generator with ForegroundEdgePerceptualLoss + optional dynamic
+    auxiliary losses (temporal consistency + k-space data consistency).
 
 Stage 2 — adversarial fine-tuning:
-    Adds a PatchGAN discriminator with relativistic adversarial loss. A
-    k-space consistency term prevents the GAN from hallucinating anatomy by
-    enforcing that the low-frequency content of the SR output matches the
-    LR input in a 32×32 region around the DC peak.
+    Adds a PatchGAN discriminator with relativistic adversarial loss. Dynamic
+    SR batches are fed to the discriminator alongside synthetic batches so the
+    generator is encouraged to produce outputs with consistent statistics across
+    both domains.
 
 Usage:
-    # Full two-stage run
+    # Full two-stage with dynamic stream
     python train_gan.py \\
         --input-dir data/images/Synth_LR \\
         --target-dir data/images/HR \\
+        --dynamic-dir data/images/Dynamic_128 \\
         --output-dir outputs/gan \\
-        --pretrain-epochs 100 --gan-epochs 200
+        --pretrain-epochs 150 --gan-epochs 0 \\
+        --temporal
 
-    # Skip pretraining — fine-tune an existing generator
+    # Skip pretraining — GAN fine-tune from existing generator
     python train_gan.py \\
         --input-dir data/images/Synth_LR \\
         --target-dir data/images/HR \\
         --output-dir outputs/gan \\
-        --pretrain-epochs 0 --gan-epochs 200 \\
-        --generator-checkpoint outputs/proposed_run/best_model.pth
-
-    # Stage 1 only (useful to compare with/without GAN)
-    python train_gan.py \\
-        --input-dir data/images/Synth_LR \\
-        --target-dir data/images/HR \\
-        --output-dir outputs/gan \\
-        --pretrain-epochs 100 --gan-epochs 0
+        --pretrain-epochs 0 --gan-epochs 50 \\
+        --lambda-adv 0.003 \\
+        --generator-checkpoint outputs/pretrained_generator.pth \\
+        --temporal
 """
 
 import argparse
+import itertools
 import json
 import time
 from pathlib import Path
@@ -53,11 +49,14 @@ from torch.utils.data import DataLoader
 from models import (
     ForegroundEdgePerceptualLoss,
     KSpaceConsistencyLoss,
+    TemporalConsistencyLoss,
     build_discriminator,
     build_proposed2,
 )
 from train import (
+    DynamicMRIDataset,
     PairedMRIDataset,
+    _DEFAULT_DYNAMIC_EXCLUDE,
     pick_device,
     set_seed,
     split_subjects,
@@ -65,15 +64,10 @@ from train import (
 
 
 # ---------------------------------------------------------------------------
-# Adversarial losses
+# Adversarial losses (Relativistic average GAN)
 # ---------------------------------------------------------------------------
 
 def generator_adv_loss(real_out: torch.Tensor, fake_out: torch.Tensor) -> torch.Tensor:
-    """
-    Relativistic average GAN loss for the generator.
-    Makes fake samples look more real than real samples on average.
-    More stable than vanilla BCE for SR tasks (used in ESRGAN).
-    """
     return F.binary_cross_entropy_with_logits(
         fake_out - real_out.mean(),
         torch.ones_like(fake_out),
@@ -81,7 +75,6 @@ def generator_adv_loss(real_out: torch.Tensor, fake_out: torch.Tensor) -> torch.
 
 
 def discriminator_adv_loss(real_out: torch.Tensor, fake_out: torch.Tensor) -> torch.Tensor:
-    """Relativistic average GAN loss for the discriminator."""
     real_loss = F.binary_cross_entropy_with_logits(
         real_out - fake_out.mean(),
         torch.ones_like(real_out),
@@ -99,58 +92,116 @@ def discriminator_adv_loss(real_out: torch.Tensor, fake_out: torch.Tensor) -> to
 
 def pretrain_epoch(
     generator: nn.Module,
-    dataloader: DataLoader,
-    criterion: nn.Module,
+    paired_loader: DataLoader,
+    dynamic_loader: DataLoader | None,
+    pixel_criterion: nn.Module,
+    temporal_criterion: TemporalConsistencyLoss,
+    kspace_criterion: KSpaceConsistencyLoss,
     optimizer: Adam,
     device: torch.device,
     max_grad_norm: float,
-) -> float:
+    lambda_temporal: float,
+    lambda_kspace_dyn: float,
+) -> dict[str, float]:
     generator.train()
-    running_loss = 0.0
-    for batch in dataloader:
+    totals: dict[str, float] = {"sup": 0.0, "temporal": 0.0, "kspace_dyn": 0.0, "total": 0.0}
+
+    dyn_iter = itertools.cycle(dynamic_loader) if dynamic_loader is not None else None
+
+    for batch in paired_loader:
         inputs = batch["input"].to(device)
         targets = batch["target"].to(device)
+
         optimizer.zero_grad(set_to_none=True)
+
         sr = generator(inputs)
-        loss = criterion(sr, targets)
-        loss.backward()
+        loss_sup = pixel_criterion(sr, targets)
+
+        loss_temporal = torch.zeros(1, device=device)
+        loss_kspace_dyn = torch.zeros(1, device=device)
+        loss_total = loss_sup
+
+        if dyn_iter is not None:
+            dyn_batch = next(dyn_iter)
+            wt = dyn_batch["window_t"].to(device)
+            wt1 = dyn_batch["window_t1"].to(device)
+
+            sr_t = generator(wt)
+            sr_t1 = generator(wt1)
+
+            loss_temporal = temporal_criterion(sr_t, sr_t1, wt)
+            loss_kspace_dyn = kspace_criterion(sr_t, wt[:, 1:2])
+            loss_total = loss_sup + lambda_temporal * loss_temporal + lambda_kspace_dyn * loss_kspace_dyn
+
+        loss_total.backward()
         nn.utils.clip_grad_norm_(generator.parameters(), max_norm=max_grad_norm)
         optimizer.step()
-        running_loss += float(loss.item())
-    return running_loss / max(1, len(dataloader))
+
+        totals["sup"] += float(loss_sup.item())
+        totals["temporal"] += float(loss_temporal.item())
+        totals["kspace_dyn"] += float(loss_kspace_dyn.item())
+        totals["total"] += float(loss_total.item())
+
+    n = max(1, len(paired_loader))
+    return {k: v / n for k, v in totals.items()}
 
 
 def gan_epoch(
     generator: nn.Module,
     discriminator: nn.Module,
-    dataloader: DataLoader,
+    paired_loader: DataLoader,
+    dynamic_loader: DataLoader | None,
     pixel_criterion: nn.Module,
     kspace_criterion: KSpaceConsistencyLoss,
+    temporal_criterion: TemporalConsistencyLoss,
     g_optimizer: Adam,
     d_optimizer: Adam,
     device: torch.device,
     max_grad_norm: float,
     lambda_adv: float,
     lambda_kspace: float,
+    lambda_temporal: float,
+    lambda_kspace_dyn: float,
 ) -> dict[str, float]:
     generator.train()
     discriminator.train()
 
-    totals: dict[str, float] = {"g_total": 0.0, "g_pixel": 0.0, "g_adv": 0.0, "g_kspace": 0.0, "d_loss": 0.0}
+    totals: dict[str, float] = {
+        "g_total": 0.0, "g_pixel": 0.0, "g_adv": 0.0,
+        "g_kspace": 0.0, "g_temporal": 0.0, "d_loss": 0.0,
+    }
 
-    for batch in dataloader:
+    dyn_iter = itertools.cycle(dynamic_loader) if dynamic_loader is not None else None
+
+    for batch in paired_loader:
         lr = batch["input"].to(device)
         hr = batch["target"].to(device)
+
+        # Optional dynamic batch
+        dyn_sr = None
+        if dyn_iter is not None:
+            dyn_batch = next(dyn_iter)
+            wt = dyn_batch["window_t"].to(device)
+            wt1 = dyn_batch["window_t1"].to(device)
 
         # ------------------------------------------------------------------
         # Discriminator step
         # ------------------------------------------------------------------
         with torch.no_grad():
             sr = generator(lr)
+            if dyn_iter is not None:
+                dyn_sr = generator(wt)
 
         real_out = discriminator(hr)
-        fake_out = discriminator(sr.detach())
-        d_loss = discriminator_adv_loss(real_out, fake_out)
+        if dyn_iter is not None:
+            # Feed both synthetic SR and dynamic SR as fake samples
+            fake_combined = torch.cat([sr, dyn_sr], dim=0)
+            real_expanded = real_out.repeat(2, 1, 1, 1) if real_out.shape[0] == sr.shape[0] else real_out
+            fake_out = discriminator(fake_combined.detach())
+            d_loss = discriminator_adv_loss(real_expanded, fake_out)
+        else:
+            fake_out = discriminator(sr.detach())
+            d_loss = discriminator_adv_loss(real_out, fake_out)
 
         d_optimizer.zero_grad(set_to_none=True)
         d_loss.backward()
@@ -161,7 +212,6 @@ def gan_epoch(
         # Generator step
         # ------------------------------------------------------------------
         sr = generator(lr)
-
         real_out = discriminator(hr).detach()
         fake_out = discriminator(sr)
 
@@ -169,7 +219,21 @@ def gan_epoch(
         g_adv = generator_adv_loss(real_out, fake_out)
         g_kspace = kspace_criterion(sr, lr)
 
-        g_loss = g_pixel + lambda_adv * g_adv + lambda_kspace * g_kspace
+        g_temporal = torch.zeros(1, device=device)
+        g_kspace_dyn = torch.zeros(1, device=device)
+        if dyn_iter is not None:
+            sr_t = generator(wt)
+            sr_t1 = generator(wt1)
+            g_temporal = temporal_criterion(sr_t, sr_t1, wt)
+            g_kspace_dyn = kspace_criterion(sr_t, wt[:, 1:2])
+
+        g_loss = (
+            g_pixel
+            + lambda_adv * g_adv
+            + lambda_kspace * g_kspace
+            + lambda_temporal * g_temporal
+            + lambda_kspace_dyn * g_kspace_dyn
+        )
 
         g_optimizer.zero_grad(set_to_none=True)
         g_loss.backward()
@@ -180,13 +244,14 @@ def gan_epoch(
         totals["g_pixel"] += float(g_pixel.item())
         totals["g_adv"] += float(g_adv.item())
         totals["g_kspace"] += float(g_kspace.item())
+        totals["g_temporal"] += float(g_temporal.item())
         totals["d_loss"] += float(d_loss.item())
 
-    n = max(1, len(dataloader))
+    n = max(1, len(paired_loader))
     return {k: v / n for k, v in totals.items()}
 
 
-def val_loss(
+def compute_val_loss(
     generator: nn.Module,
     dataloader: DataLoader,
     criterion: nn.Module,
@@ -211,6 +276,11 @@ def train(args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     device = pick_device(args.device)
 
+    temporal = getattr(args, "temporal", False)
+    use_dynamic = getattr(args, "dynamic_dir", None) and not getattr(args, "no_dynamic", False)
+    lambda_temporal = float(getattr(args, "lambda_temporal", 0.10))
+    lambda_kspace_dyn = float(getattr(args, "lambda_kspace_dyn", 0.05))
+
     train_subjects, val_subjects, _ = split_subjects(args.subjects, args.val_subject, args.test_subject)
 
     common_dataset_kwargs: dict[str, Any] = dict(
@@ -218,6 +288,7 @@ def train(args: argparse.Namespace) -> None:
         target_dir=Path(args.target_dir),
         model_name="proposed2",
         proposed_target_size=args.proposed_target_size,
+        temporal=temporal,
     )
     train_dataset = PairedMRIDataset(
         **common_dataset_kwargs,
@@ -230,11 +301,24 @@ def train(args: argparse.Namespace) -> None:
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    generator = build_proposed2(n_res_blocks=16, n_feats=64, reduction=16, res_scale=0.1).to(device)
+    dynamic_loader = None
+    if use_dynamic:
+        exclude = set(getattr(args, "exclude_files", [])) | _DEFAULT_DYNAMIC_EXCLUDE
+        dyn_dataset = DynamicMRIDataset(
+            dynamic_dir=Path(args.dynamic_dir),
+            exclude_files=exclude,
+            augment=args.augment,
+        )
+        dynamic_loader = DataLoader(dyn_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=True)
+        print(f"Dynamic stream: {len(dyn_dataset)} samples from {args.dynamic_dir}", flush=True)
+
+    in_channels = 3 if temporal else 1
+    generator = build_proposed2(n_res_blocks=16, n_feats=64, reduction=16, res_scale=0.1, in_channels=in_channels).to(device)
     discriminator = build_discriminator(base_filters=64).to(device)
 
     pixel_criterion = ForegroundEdgePerceptualLoss(alpha_percep=args.alpha_percep).to(device)
     kspace_criterion = KSpaceConsistencyLoss(region_size=32)
+    temporal_criterion = TemporalConsistencyLoss().to(device)
 
     # -----------------------------------------------------------------------
     # Stage 1: Generator pretraining
@@ -243,7 +327,7 @@ def train(args: argparse.Namespace) -> None:
 
     if args.pretrain_epochs > 0:
         if args.generator_checkpoint:
-            print(f"Loading generator from {args.generator_checkpoint} for pretraining warmstart.", flush=True)
+            print(f"Loading generator from {args.generator_checkpoint} for warmstart.", flush=True)
             _load_generator(generator, Path(args.generator_checkpoint), device)
 
         g_optimizer = Adam(generator.parameters(), lr=args.pretrain_lr, weight_decay=args.weight_decay)
@@ -254,12 +338,24 @@ def train(args: argparse.Namespace) -> None:
         print(f"\n--- Stage 1: Pretraining generator for {args.pretrain_epochs} epochs ---", flush=True)
         for epoch in range(1, args.pretrain_epochs + 1):
             t0 = time.time()
-            train_l = pretrain_epoch(generator, train_loader, pixel_criterion, g_optimizer, device, args.max_grad_norm)
-            val_l = val_loss(generator, val_loader, pixel_criterion, device)
+            metrics = pretrain_epoch(
+                generator, train_loader, dynamic_loader,
+                pixel_criterion, temporal_criterion, kspace_criterion,
+                g_optimizer, device, args.max_grad_norm,
+                lambda_temporal=lambda_temporal,
+                lambda_kspace_dyn=lambda_kspace_dyn,
+            )
+            val_l = compute_val_loss(generator, val_loader, pixel_criterion, device)
             g_scheduler.step()
             elapsed = time.time() - t0
-            print(f"Pretrain {epoch:03d}/{args.pretrain_epochs} | train={train_l:.6f} | val={val_l:.6f} | {elapsed:.1f}s", flush=True)
-            pretrain_history.append({"epoch": epoch, "train_loss": train_l, "val_loss": val_l})
+            dyn_str = (f" t={metrics['temporal']:.4f} ks={metrics['kspace_dyn']:.4f}"
+                       if use_dynamic else "")
+            print(
+                f"Pretrain {epoch:03d}/{args.pretrain_epochs} | "
+                f"train={metrics['total']:.6f}{dyn_str} | val={val_l:.6f} | {elapsed:.1f}s",
+                flush=True,
+            )
+            pretrain_history.append({"epoch": epoch, "val_loss": val_l, **metrics})
             if val_l < best_val:
                 best_val = val_l
                 torch.save({"model_state_dict": generator.state_dict()}, pretrain_ckpt)
@@ -280,7 +376,6 @@ def train(args: argparse.Namespace) -> None:
         print("GAN epochs = 0, stopping after pretraining.", flush=True)
         return
 
-    # Reload best pretrained generator before GAN stage
     if pretrain_ckpt.exists():
         _load_generator(generator, pretrain_ckpt, device)
 
@@ -295,17 +390,23 @@ def train(args: argparse.Namespace) -> None:
 
     print(f"\n--- Stage 2: GAN fine-tuning for {args.gan_epochs} epochs ---", flush=True)
     print(f"    lambda_adv={args.lambda_adv}  lambda_kspace={args.lambda_kspace}", flush=True)
+    if use_dynamic:
+        print(f"    lambda_temporal={lambda_temporal}  lambda_kspace_dyn={lambda_kspace_dyn}", flush=True)
+
     for epoch in range(1, args.gan_epochs + 1):
         t0 = time.time()
         metrics = gan_epoch(
             generator, discriminator,
-            train_loader, pixel_criterion, kspace_criterion,
+            train_loader, dynamic_loader,
+            pixel_criterion, kspace_criterion, temporal_criterion,
             g_optimizer, d_optimizer,
             device, args.max_grad_norm,
             lambda_adv=args.lambda_adv,
             lambda_kspace=args.lambda_kspace,
+            lambda_temporal=lambda_temporal,
+            lambda_kspace_dyn=lambda_kspace_dyn,
         )
-        val_l = val_loss(generator, val_loader, pixel_criterion, device)
+        val_l = compute_val_loss(generator, val_loader, pixel_criterion, device)
         g_scheduler.step()
         d_scheduler.step()
         elapsed = time.time() - t0
@@ -313,8 +414,9 @@ def train(args: argparse.Namespace) -> None:
         print(
             f"GAN {epoch:03d}/{args.gan_epochs} | "
             f"G={metrics['g_total']:.4f} (pix={metrics['g_pixel']:.4f} "
-            f"adv={metrics['g_adv']:.4f} ks={metrics['g_kspace']:.4f}) | "
-            f"D={metrics['d_loss']:.4f} | val={val_l:.6f} | {elapsed:.1f}s",
+            f"adv={metrics['g_adv']:.4f} ks={metrics['g_kspace']:.4f}"
+            + (f" t={metrics['g_temporal']:.4f}" if use_dynamic else "")
+            + f") | D={metrics['d_loss']:.4f} | val={val_l:.6f} | {elapsed:.1f}s",
             flush=True,
         )
         gan_history.append({"epoch": epoch, "val_loss": val_l, **metrics})
@@ -323,7 +425,6 @@ def train(args: argparse.Namespace) -> None:
             best_val = val_l
             torch.save({"model_state_dict": generator.state_dict()}, best_gan_ckpt)
 
-        # Save discriminator separately in case fine-tuning needs to be resumed
         torch.save({"model_state_dict": discriminator.state_dict()}, output_dir / "discriminator_latest.pth")
 
     with (output_dir / "gan_history.json").open("w") as f:
@@ -356,34 +457,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subjects", nargs="+", default=["0021", "0022", "0023", "0024", "0025", "0026", "0027"])
     parser.add_argument("--val-subject", type=str, default="0022")
     parser.add_argument("--test-subject", type=str, default="0021")
-    parser.add_argument("--proposed-target-size", type=int, default=1024)
+    parser.add_argument("--proposed-target-size", type=int, default=512)
 
     # Patching and augmentation
-    parser.add_argument("--patch-size", type=int, default=64,
-                        help="LR patch size (default 64 → 512 HR patch). Set to 0 to disable patching.")
-    parser.add_argument("--augment", action="store_true", default=True,
-                        help="Random horizontal flip (default: on).")
+    parser.add_argument("--patch-size", type=int, default=64)
+    parser.add_argument("--augment", action="store_true", default=True)
+
+    # Temporal mode
+    parser.add_argument("--temporal", action="store_true",
+                        help="3-channel input (t-1, t, t+1). Required when using dynamic stream.")
+
+    # Dynamic auxiliary stream
+    parser.add_argument("--dynamic-dir", type=str, default=None)
+    parser.add_argument("--lambda-temporal", type=float, default=0.10)
+    parser.add_argument("--lambda-kspace-dyn", type=float, default=0.05)
+    parser.add_argument("--exclude-files", nargs="*", default=[])
+    parser.add_argument("--no-dynamic", action="store_true")
 
     # Stage 1 — pretraining
-    parser.add_argument("--pretrain-epochs", type=int, default=100,
-                        help="Generator pretraining epochs before GAN (0 to skip).")
+    parser.add_argument("--pretrain-epochs", type=int, default=100)
     parser.add_argument("--pretrain-lr", type=float, default=1e-4)
-    parser.add_argument("--generator-checkpoint", type=str, default=None,
-                        help="Path to existing generator .pth to warm-start from.")
+    parser.add_argument("--generator-checkpoint", type=str, default=None)
 
     # Stage 2 — GAN
-    parser.add_argument("--gan-epochs", type=int, default=200,
-                        help="Adversarial fine-tuning epochs (0 to stop after pretraining).")
-    parser.add_argument("--gan-lr", type=float, default=1e-4,
-                        help="Generator LR for GAN stage. Discriminator uses half this value.")
-    parser.add_argument("--lambda-adv", type=float, default=0.01,
-                        help="Weight of the adversarial loss. Start small (0.01) and increase if output is still blurry.")
-    parser.add_argument("--lambda-kspace", type=float, default=0.1,
-                        help="Weight of the k-space consistency loss. Prevents hallucination of anatomy.")
+    parser.add_argument("--gan-epochs", type=int, default=200)
+    parser.add_argument("--gan-lr", type=float, default=1e-4)
+    parser.add_argument("--lambda-adv", type=float, default=0.003)
+    parser.add_argument("--lambda-kspace", type=float, default=0.1)
 
     # Loss
-    parser.add_argument("--alpha-percep", type=float, default=0.1,
-                        help="Weight of VGG perceptual term in ForegroundEdgePerceptualLoss.")
+    parser.add_argument("--alpha-percep", type=float, default=0.1)
 
     # Optimisation
     parser.add_argument("--weight-decay", type=float, default=1e-5)
@@ -391,7 +494,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default="auto", help="auto, cpu, cuda, mps")
+    parser.add_argument("--device", type=str, default="auto")
 
     return parser.parse_args()
 
@@ -399,7 +502,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
-    # patch_size=0 means no patching
     if args.patch_size == 0:
         args.patch_size = None
     train(args)

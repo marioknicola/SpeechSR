@@ -105,18 +105,19 @@ class FastMRIDataset(Dataset):
     then synthesise a 128×128 LR input via k-space truncation.
 
     The resulting pairs match the SpeechSR training format:
-        LR: 128×128 magnitude image (tensor shape 1×128×128)
-        HR: 1024×1024 k-space zero-padded image (tensor shape 1×1024×1024)
+        LR: 128×128 magnitude image (tensor shape 3×128×128 in temporal mode)
+        HR: 512×512 k-space zero-padded image (tensor shape 1×512×512)
     """
 
     def __init__(
         self,
         data_dir: Path,
-        target_size: int = 1024,
+        target_size: int = 512,
         lr_size: int = 128,
         patch_size: int | None = None,
         augment: bool = False,
         max_files: int | None = None,
+        in_channels: int = 3,
     ) -> None:
         if not HAS_H5PY:
             raise ImportError("h5py is required. Install with: pip install h5py")
@@ -125,6 +126,7 @@ class FastMRIDataset(Dataset):
         self.lr_size = lr_size
         self.patch_size = patch_size
         self.augment = augment
+        self.in_channels = in_channels
 
         h5_files = sorted(data_dir.glob("*.h5"))
         if max_files is not None:
@@ -185,8 +187,13 @@ class FastMRIDataset(Dataset):
         lr = kspace_truncate(hr_full, self.lr_size)       # 128×128
         hr = kspace_zeropad(hr_full, self.target_size)    # 1024×1024
 
-        lr_t = torch.from_numpy(lr).unsqueeze(0)   # (1, 128, 128)
-        hr_t = torch.from_numpy(hr).unsqueeze(0)   # (1, 1024, 1024)
+        # For temporal mode, repeat single frame across all 3 channels so the
+        # head weights are primed; real temporal context comes from dynamic data.
+        if self.in_channels == 3:
+            lr_t = torch.from_numpy(lr).unsqueeze(0).repeat(3, 1, 1)  # (3, H, W)
+        else:
+            lr_t = torch.from_numpy(lr).unsqueeze(0)                  # (1, H, W)
+        hr_t = torch.from_numpy(hr).unsqueeze(0)   # (1, target_size, target_size)
 
         if self.patch_size is not None:
             lr_t, hr_t = self._random_patch(lr_t, hr_t)
@@ -256,6 +263,12 @@ def train(args: argparse.Namespace) -> None:
     if not all_files:
         raise ValueError(f"No .h5 files found in {data_dir}. Check --data-dir.")
 
+    # Apply --max-files limit before the train/val split
+    max_files = getattr(args, "max_files", None)
+    if max_files is not None:
+        all_files = all_files[:max_files]
+        print(f"Using {len(all_files)} .h5 files (--max-files={max_files}).", flush=True)
+
     # Hold out the last 10% of files for validation
     n_val = max(1, len(all_files) // 10)
     train_files = all_files[:-n_val]
@@ -263,6 +276,7 @@ def train(args: argparse.Namespace) -> None:
 
     patch_size = args.patch_size if args.patch_size > 0 else None
 
+    in_channels = getattr(args, "in_channels", 3)
     train_dataset = FastMRIDataset(
         data_dir=data_dir,
         target_size=args.target_size,
@@ -270,18 +284,21 @@ def train(args: argparse.Namespace) -> None:
         patch_size=patch_size,
         augment=args.augment,
         max_files=len(train_files),
+        in_channels=in_channels,
     )
     val_dataset = FastMRIDataset(
         data_dir=data_dir,
         target_size=args.target_size,
         lr_size=args.lr_size,
         max_files=len(val_files),
+        in_channels=in_channels,
     )
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    model = build_proposed(n_res_blocks=16, n_feats=64, reduction=16, res_scale=0.1).to(device)
+    in_channels = getattr(args, "in_channels", 3)
+    model = build_proposed(n_res_blocks=16, n_feats=64, reduction=16, res_scale=0.1, in_channels=in_channels).to(device)
 
     # Optionally warm-start from an existing checkpoint
     if args.generator_checkpoint:
@@ -337,8 +354,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--target-size", type=int, default=1024, help="HR output size (k-space zero-padded).")
+    parser.add_argument("--target-size", type=int, default=512,
+                        help="HR output size in pixels (default 512 matches speech MRI pipeline).")
     parser.add_argument("--lr-size", type=int, default=128, help="LR input size (k-space truncated).")
+    parser.add_argument("--max-files", type=int, default=None,
+                        help="Limit number of .h5 files used (e.g. 150 for a manageable subset). "
+                             "Files are selected from the start of the sorted list.")
+    parser.add_argument("--in-channels", type=int, default=3, choices=[1, 3],
+                        help="1 = single-frame, 3 = temporal (default, matches train_gan.py).")
     parser.add_argument("--patch-size", type=int, default=64,
                         help="LR patch size for patch-based training. 0 to use full images.")
     parser.add_argument("--augment", action="store_true", default=True)

@@ -39,3 +39,7 @@ outputs/
 
 # Keep dataset folder skeleton
 !data/**/.gitkeep
+
+# Local findings / working notes (git-ignored; see IMPROVEMENTS.md for tracked version)
+IMPROVEMENTS_local.md
+findings*.md
